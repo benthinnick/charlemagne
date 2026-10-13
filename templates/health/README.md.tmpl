@@ -1,0 +1,197 @@
+# {{.Name}}
+
+A Go REST API scaffold with **liveness**, **readiness**, and **Prometheus metrics**.
+Jaeger and Prometheus run from one `docker compose up`{{if or .HasPostgres .HasVault}}, along with{{if .HasPostgres}} Postgres{{end}}{{if and .HasPostgres .HasVault}} and{{end}}{{if .HasVault}} Vault{{end}}{{end}}.
+
+Shared libraries come from [`github.com/benthinnick/distlibs`](https://github.com/benthinnick/distlibs).
+
+## Architecture
+
+```
+client ──▶ api HTTP (chi, :8080)   /healthz /readyz /metrics
+client ──▶ api gRPC (:9090)        application RPCs
+{{if .HasPostgres}}             ├──▶ Postgres (:5432)   readiness probe
+{{end}}             ├──▶ jaeger (:16686)    traces over OTLP gRPC
+             ├──▶ prometheus (:9090) scrapes /metrics{{if .HasVault}}
+             └──▶ vault  (:8200)     secrets, read at startup{{end}}
+```
+
+## Quick start
+
+```bash
+docker compose -f deploy/docker-compose.yml up --build
+```
+
+Then:
+
+```bash
+curl localhost:8080/healthz
+curl localhost:8080/readyz
+curl localhost:8080/metrics
+```
+
+Open the Jaeger UI at <http://localhost:16686> and pick the `{{.ServiceName}}`
+service.
+
+| Service    | URL                     | Notes                            |
+| ---------- | ----------------------- | -------------------------------- |
+| API        | http://localhost:8080   | `SERVICE_ID={{.ID}}`             |
+| API gRPC   | localhost:9091          | compose maps host 9091 → :9090   |
+{{if .HasPostgres}}| Postgres   | localhost:5432          | user/pass/db `{{.Name}}`         |
+{{end}}| Jaeger     | http://localhost:16686  | trace UI                         |
+| Prometheus | http://localhost:9090   | scrapes `api:8080/metrics`       |
+{{if .HasVault}}| Vault      | http://localhost:8200   | dev mode, token `dev-root-token` |
+{{end}}
+
+## Local Kubernetes
+
+The API Deployment runs **3 replicas**. The same stack can run on kind (recommended
+locally), Docker Desktop Kubernetes, or minikube via manifests in
+[`deploy/k8s/`](deploy/k8s/).
+
+### kind (recommended)
+
+Requires [kind](https://kind.sigs.k8s.io/) and `kubectl`. One command creates the
+cluster (with host port mappings for every NodePort), builds and loads the API
+image, and applies the manifests:
+
+```bash
+make kind
+```
+
+Useful pieces on their own:
+
+```bash
+make kind-up       # recreate the kind cluster named {{.Name}}
+make kind-load     # docker build + kind load docker-image
+make kind-deploy   # kubectl apply numbered manifests + wait for api
+make kind-down     # kind delete cluster --name {{.Name}}
+```
+
+### Other local clusters
+
+```bash
+docker build -t {{.Name}}-api:local -f build/Dockerfile .
+
+kubectl apply -f deploy/k8s/00-namespace.yaml \
+  -f deploy/k8s/01-config.yaml \
+  -f deploy/k8s/02-deps.yaml \
+  -f deploy/k8s/03-jobs.yaml \
+  -f deploy/k8s/04-api.yaml \
+  -f deploy/k8s/05-logging.yaml
+kubectl -n {{.Name}} rollout status deploy/api
+```
+
+Services are exposed with fixed NodePorts (kind maps these to the host via
+[`deploy/k8s/kind-config.yaml`](deploy/k8s/kind-config.yaml)):
+
+| Service    | URL                    |
+| ---------- | ---------------------- |
+| API        | http://localhost:30080 |
+| API gRPC   | localhost:30091        |
+| Jaeger UI  | http://localhost:30686 |
+| Prometheus | http://localhost:30090 |
+| Grafana    | http://localhost:30300 |
+{{if .HasVault}}| Vault      | http://localhost:30200 |
+{{end}}
+
+### Searching logs (Grafana + Loki)
+
+Alloy scrapes pod stdout in the `{{.Name}}` namespace into Loki. Grafana is
+provisioned with Loki (default) and Prometheus datasources; anonymous Admin
+access is enabled for local use.
+
+1. Open <http://localhost:30300> → **Explore** → datasource **Loki**.
+2. Example LogQL:
+
+```logql
+{app="api"}
+{app="api"} | json | status=`500`
+{app="api"} | json | trace_id="<paste-from-jaeger-or-response>"
+```
+
+Tear down with:
+
+```bash
+make kind-down
+# or, without kind: kubectl delete -f deploy/k8s/00-namespace.yaml
+```
+
+## Endpoints
+
+| Method | Path       | Behaviour                                              |
+| ------ | ---------- | ------------------------------------------------------ |
+| GET    | `/healthz` | Liveness. Never touches a dependency.                  |
+| GET    | `/readyz`  | Probes listed dependencies{{if or .HasPostgres .HasVault}} ({{if .HasPostgres}}Postgres{{end}}{{if and .HasPostgres .HasVault}}, {{end}}{{if .HasVault}}Vault when enabled{{end}}){{end}}; 503 if any fail. |
+| GET    | `/metrics` | Prometheus exposition (request count, latency, sizes). |
+
+## Configuration
+
+Config is assembled from struct defaults, then environment variables{{if .HasVault}}, then Vault when `VAULT_ENABLED=true`{{end}}. See
+[.env.example](.env.example). `SERVICE_ID` defaults to `{{.ID}}`.
+{{if .HasVault}}
+Vault KV v2 path: `${VAULT_KV_MOUNT}/${VAULT_SECRET_PATH}` (default `secret/{{.Name}}/config`).
+Keys Vault may overlay: `log_level` and `otel_traces_sampler_arg`.
+{{end}}
+
+## Observability
+
+**Tracing.** [`github.com/benthinnick/distlibs/observability`](https://github.com/benthinnick/distlibs)
+builds a `TracerProvider` that batches spans to the OTLP gRPC endpoint.
+Server spans are renamed to the chi route pattern after routing.
+
+**Logging.** [`github.com/benthinnick/distlibs/observability`](https://github.com/benthinnick/distlibs)
+wraps `slog`'s JSON handler so every record written with a request context
+picks up `trace_id` and `span_id`.
+
+**Metrics.** [`github.com/benthinnick/distlibs/httpmw`](https://github.com/benthinnick/distlibs) records RED and
+size series on a dedicated Prometheus registry and serves them at `/metrics`.
+`/healthz`, `/readyz`, and `/metrics` themselves are not counted. Labels are
+`method`, `route` (chi pattern), and `status`.
+
+| Metric | Type | Meaning |
+| ------ | ---- | ------- |
+| `http_requests_total` | counter | request count |
+| `http_request_duration_seconds` | histogram | latency |
+| `http_request_size_bytes` | histogram | bytes read from the request body |
+| `http_response_size_bytes` | histogram | bytes written in the response |
+
+Example PromQL in the Prometheus UI at <http://localhost:9090>:
+
+```promql
+sum by (status) (rate(http_requests_total[1m]))
+```
+
+## Development
+
+```bash
+go test ./... -count=1
+go vet ./...
+{{if .HasPostgres}}go generate ./internal/providers   # regenerate mockgen provider mocks
+{{end}}```
+
+Usecase unit tests live under `tests/usecase/`.
+
+A `Makefile` wraps the common targets (`make test`, `make up`, `make down`,
+`make logs`). `make test` passes `-race`, which needs cgo and a 64-bit C
+toolchain; on hosts without one, run `make test TESTFLAGS=`.
+
+## Layout
+
+```
+cmd/api/                  entrypoint, wiring, graceful shutdown
+internal/config/          layered config
+internal/entity/          Health, Readiness, ErrorResponse, generated RPC types
+{{if .HasPostgres}}internal/ent/schema/      ent table definitions (owned by this service)
+{{end}}internal/proto/           buf-generated protobuf + gRPC stubs
+internal/server/          HTTP health routes and generated gRPC service
+internal/usecase/         readiness probing and generated RPC methods
+internal/providers/       dependency adapters
+tests/usecase/            usecase unit tests
+build/Dockerfile          multi-stage build onto distroless
+deploy/                   compose stack
+deploy/k8s/               local Kubernetes manifests + kind-config.yaml
+```
+
+Shared HTTP, observability{{if or .HasPostgres .HasVault}},{{end}}{{if .HasPostgres}} postgres{{end}}{{if .HasVault}}, and vault{{end}} helpers come from
+[`github.com/benthinnick/distlibs`](https://github.com/benthinnick/distlibs).

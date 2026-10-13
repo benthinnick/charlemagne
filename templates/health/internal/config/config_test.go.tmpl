@@ -1,0 +1,204 @@
+package config
+
+import (
+	"context"
+	"os"
+	"strings"
+	"testing"
+{{if .HasVault}}
+	"errors"
+{{end}}
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// managedEnv lists every variable the loader reads, so tests can start from a
+// clean slate regardless of what the developer's shell exports.
+var managedEnv = []string{
+	"APP_ENV", "LOG_LEVEL", "SERVICE_ID", "HTTP_ADDR", "GRPC_ADDR", "HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT",
+	"HTTP_IDLE_TIMEOUT", "HTTP_REQUEST_TIMEOUT", "SHUTDOWN_TIMEOUT",
+{{if .HasPostgres}}	"POSTGRES_DSN", "POSTGRES_MAX_CONNS", "POSTGRES_CONN_TIMEOUT",
+{{end}}{{if .HasVault}}	"VAULT_ENABLED", "VAULT_ADDR", "VAULT_TOKEN", "VAULT_KV_MOUNT", "VAULT_SECRET_PATH", "VAULT_TIMEOUT",
+{{end}}	"OTEL_ENABLED", "OTEL_SERVICE_NAME", "OTEL_SERVICE_VERSION", "OTEL_EXPORTER_OTLP_ENDPOINT",
+	"OTEL_EXPORTER_OTLP_INSECURE", "OTEL_TRACES_SAMPLER_ARG",
+}
+
+func isolateEnv(t *testing.T, overrides map[string]string) {
+	t.Helper()
+	for _, key := range managedEnv {
+		if original, ok := os.LookupEnv(key); ok {
+			t.Cleanup(func() { os.Setenv(key, original) })
+			require.NoError(t, os.Unsetenv(key))
+		}
+	}
+	for key, value := range overrides {
+		t.Setenv(key, value)
+	}
+}
+{{if .HasVault}}
+type stubReader struct {
+	secrets map[string]string
+	err     error
+	calls   int
+}
+
+func (s *stubReader) ReadSecrets(context.Context) (map[string]string, error) {
+	s.calls++
+	return s.secrets, s.err
+}
+{{end}}
+func TestLoadPrecedence(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     map[string]string
+{{if .HasVault}}		secrets map[string]string
+{{end}}		assert  func(t *testing.T, cfg *Config)
+	}{
+		{
+			name: "defaults apply when nothing is set",
+			env:  nil,
+			assert: func(t *testing.T, cfg *Config) {
+				assert.Equal(t, "local", cfg.Env)
+				assert.Equal(t, "info", cfg.LogLevel)
+				assert.Equal(t, "{{.ID}}", cfg.ServiceID)
+				assert.Equal(t, ":8080", cfg.HTTPAddr)
+				assert.Equal(t, ":9090", cfg.GRPCAddr)
+				assert.Equal(t, "{{.ServiceName}}", cfg.OTel.ServiceName)
+{{if .HasVault}}				assert.False(t, cfg.Vault.Enabled)
+{{end}}			},
+		},
+		{
+			name: "environment overrides defaults",
+			env: map[string]string{
+				"LOG_LEVEL":  "debug",
+				"HTTP_ADDR":  ":9000",
+				"SERVICE_ID": "custom-id",
+			},
+			assert: func(t *testing.T, cfg *Config) {
+				assert.Equal(t, "debug", cfg.LogLevel)
+				assert.Equal(t, ":9000", cfg.HTTPAddr)
+				assert.Equal(t, "custom-id", cfg.ServiceID)
+			},
+		},
+{{if .HasVault}}		{
+			name: "vault overlays log level",
+			env: map[string]string{
+				"VAULT_ENABLED": "true",
+				"VAULT_TOKEN":   "dev-root-token",
+			},
+			secrets: map[string]string{
+				"log_level": "warn",
+			},
+			assert: func(t *testing.T, cfg *Config) {
+				assert.Equal(t, "warn", cfg.LogLevel)
+			},
+		},
+		{
+			name: "blank vault values do not clobber the environment",
+			env: map[string]string{
+				"VAULT_ENABLED": "true",
+				"VAULT_TOKEN":   "dev-root-token",
+				"LOG_LEVEL":     "debug",
+			},
+			secrets: map[string]string{
+				"log_level": "   ",
+			},
+			assert: func(t *testing.T, cfg *Config) {
+				assert.Equal(t, "debug", cfg.LogLevel)
+			},
+		},
+		{
+			name: "vault is skipped entirely when disabled",
+			env: map[string]string{
+				"LOG_LEVEL": "debug",
+			},
+			secrets: map[string]string{
+				"log_level": "warn",
+			},
+			assert: func(t *testing.T, cfg *Config) {
+				assert.Equal(t, "debug", cfg.LogLevel)
+			},
+		},
+{{end}}	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateEnv(t, tc.env)
+{{if .HasVault}}			reader := &stubReader{secrets: tc.secrets}
+
+			cfg, err := load(context.Background(), func(VaultConfig) (SecretReader, error) {
+				return reader, nil
+			})
+{{else}}			cfg, err := Load(context.Background())
+{{end}}			require.NoError(t, err)
+			tc.assert(t, cfg)
+		})
+	}
+}
+
+func TestLoadErrors(t *testing.T) {
+	tests := []struct {
+		name        string
+		env         map[string]string
+{{if .HasVault}}		readerErr   error
+{{end}}		wantMessage string
+	}{
+{{if .HasVault}}		{
+			name:        "vault enabled without a token",
+			env:         map[string]string{"VAULT_ENABLED": "true"},
+			wantMessage: "VAULT_TOKEN is empty",
+		},
+		{
+			name:        "vault read failure is fatal",
+			env:         map[string]string{"VAULT_ENABLED": "true", "VAULT_TOKEN": "t"},
+			readerErr:   errors.New("connection refused"),
+			wantMessage: "read secrets from vault",
+		},
+{{end}}		{
+			name:        "invalid log level",
+			env:         map[string]string{"LOG_LEVEL": "chatty"},
+			wantMessage: "LOG_LEVEL",
+		},
+		{
+			name:        "sampler ratio out of range",
+			env:         map[string]string{"OTEL_TRACES_SAMPLER_ARG": "1.5"},
+			wantMessage: "OTEL_TRACES_SAMPLER_ARG",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateEnv(t, tc.env)
+{{if .HasVault}}
+			_, err := load(context.Background(), func(VaultConfig) (SecretReader, error) {
+				return &stubReader{err: tc.readerErr}, nil
+			})
+{{else}}
+			_, err := Load(context.Background())
+{{end}}			require.Error(t, err)
+			assert.True(t, strings.Contains(err.Error(), tc.wantMessage),
+				"error %q should mention %q", err.Error(), tc.wantMessage)
+		})
+	}
+}
+{{if .HasVault}}
+func TestLoadVaultSkippedWhenDisabled(t *testing.T) {
+	isolateEnv(t, nil)
+	reader := &stubReader{}
+
+	_, err := load(context.Background(), func(VaultConfig) (SecretReader, error) {
+		return reader, nil
+	})
+	require.NoError(t, err)
+	assert.Zero(t, reader.calls, "vault must not be contacted when disabled")
+}
+
+func TestApplyVaultRequiresAddress(t *testing.T) {
+	cfg := &Config{Vault: VaultConfig{Enabled: true, Token: "t"}}
+	err := applyVault(context.Background(), cfg, func(VaultConfig) (SecretReader, error) {
+		return &stubReader{}, nil
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "VAULT_ADDR")
+}
+{{end}}

@@ -1,0 +1,42 @@
+package usecase_test
+
+import (
+	"log/slog"
+	"testing"
+
+	"github.com/stretchr/testify/suite"
+{{if .HasPostgres}}	"go.uber.org/mock/gomock"
+
+{{end}}	"{{.Module}}/internal/providers"
+	"{{.Module}}/internal/usecase"
+{{if .HasPostgres}}	providermocks "{{.Module}}/tests/mocks/providers"
+{{end}})
+
+// UseCaseSuite builds a fresh use case and mock providers for every test.
+type UseCaseSuite struct {
+	suite.Suite
+{{if .HasPostgres}}
+	ctrl     *gomock.Controller
+	Postgres *providermocks.MockPostgres
+{{end}}	UC usecase.UseCase
+}
+
+func TestUseCaseSuite(t *testing.T) {
+	suite.Run(t, new(UseCaseSuite))
+}
+
+func (s *UseCaseSuite) SetupTest() {
+{{if .HasPostgres}}	s.ctrl = gomock.NewController(s.T())
+	s.Postgres = providermocks.NewMockPostgres(s.ctrl)
+	s.UC = usecase.New(providers.Providers{
+		Postgres: s.Postgres,
+	}, nil, slog.New(slog.DiscardHandler))
+{{else}}	s.UC = usecase.New(providers.Providers{}, nil, slog.New(slog.DiscardHandler))
+{{end}}}
+
+func (s *UseCaseSuite) newUseCaseWithChecks(checks []usecase.Check) usecase.UseCase {
+{{if .HasPostgres}}	return usecase.New(providers.Providers{
+		Postgres: s.Postgres,
+	}, checks, slog.New(slog.DiscardHandler))
+{{else}}	return usecase.New(providers.Providers{}, checks, slog.New(slog.DiscardHandler))
+{{end}}}

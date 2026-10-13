@@ -1,0 +1,43 @@
+// Package providers adapts the external systems the application talks to into
+// the ports the use case depends on. It is the only place that knows both the
+// vocabulary of a client library and the vocabulary of the domain.
+package providers
+{{if .HasPostgres}}
+//go:generate go run go.uber.org/mock/mockgen@v0.6.0 -destination=../../tests/mocks/providers/mocks.go -package=providermocks . Postgres
+
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Postgres is the port for the database the service depends on.
+type Postgres interface {
+	Ping(ctx context.Context) error
+}
+
+// Providers is the full set of external systems, assembled in main and handed
+// to the use case as one value so adding a dependency does not change every
+// constructor signature along the way.
+type Providers struct {
+	Postgres Postgres
+}
+
+// PostgresProvider fulfils Postgres against a pgx pool.
+type PostgresProvider struct {
+	pool *pgxpool.Pool
+}
+
+func NewPostgres(pool *pgxpool.Pool) *PostgresProvider {
+	return &PostgresProvider{pool: pool}
+}
+
+func (p *PostgresProvider) Ping(ctx context.Context) error {
+	return p.pool.Ping(ctx)
+}
+{{else}}
+// Providers is the full set of external systems, assembled in main and handed
+// to the use case as one value so adding a dependency does not change every
+// constructor signature along the way.
+type Providers struct{}
+{{end}}

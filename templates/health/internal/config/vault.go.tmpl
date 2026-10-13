@@ -1,0 +1,18 @@
+package config
+
+import "github.com/benthinnick/distlibs/vault"
+
+var _ SecretReader = (*vault.Reader)(nil)
+
+// NewVaultReader adapts the application's Vault settings to the reader library.
+// Both the config overlay and the readiness probe go through here, so the
+// mapping lives in one place.
+func NewVaultReader(cfg VaultConfig) (*vault.Reader, error) {
+	return vault.NewReader(vault.Config{
+		Address:    cfg.Address,
+		Token:      cfg.Token,
+		KVMount:    cfg.KVMount,
+		SecretPath: cfg.SecretPath,
+		Timeout:    cfg.Timeout,
+	})
+}

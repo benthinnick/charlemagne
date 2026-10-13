@@ -1,0 +1,92 @@
+package server
+
+import (
+	"errors"
+	"log/slog"
+	"net/http"
+
+	"github.com/go-chi/chi/v5/middleware"
+	"go.opentelemetry.io/otel/trace"
+
+	"{{.Module}}/internal/entity"
+)
+
+// marshaler is what every response payload satisfies: entity types render their
+// own wire form, so this package never touches encoding/json.
+type marshaler interface {
+	Marshal() ([]byte, error)
+}
+
+func (a *API) writeJSON(w http.ResponseWriter, r *http.Request, status int, payload marshaler) {
+	body, err := payload.Marshal()
+	if err != nil {
+		a.logger.ErrorContext(r.Context(), "encode response body", slog.Any("error", err))
+		a.InternalError(w, r)
+		return
+	}
+	a.write(w, r, status, body)
+}
+
+func (a *API) write(w http.ResponseWriter, r *http.Request, status int, body []byte) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+
+	if _, err := w.Write(append(body, '\n')); err != nil {
+		// The status line is already on the wire; all we can do is record it.
+		a.logger.ErrorContext(r.Context(), "write response body", slog.Any("error", err))
+	}
+}
+
+// writeError renders the standard error body.
+func (a *API) writeError(w http.ResponseWriter, r *http.Request, status int, message, detail string) {
+	payload := entity.ErrorResponse{
+		Error:     message,
+		Detail:    detail,
+		RequestID: middleware.GetReqID(r.Context()),
+	}
+	if sc := trace.SpanContextFromContext(r.Context()); sc.IsValid() {
+		payload.TraceID = sc.TraceID().String()
+	}
+
+	body, err := payload.Marshal()
+	if err != nil {
+		a.logger.ErrorContext(r.Context(), "encode error body", slog.Any("error", err))
+		w.WriteHeader(status)
+		return
+	}
+	a.write(w, r, status, body)
+}
+
+// InternalError renders the generic 500. It is exported because the recoverer
+// middleware renders through it, which is what keeps a panic response the same
+// shape as every other failure.
+func (a *API) InternalError(w http.ResponseWriter, r *http.Request) {
+	a.writeError(w, r, http.StatusInternalServerError, "internal_error",
+		"the request could not be completed")
+}
+
+// writeServiceError translates a domain error into the status this API reports
+// to its own callers.
+func (a *API) writeServiceError(w http.ResponseWriter, r *http.Request, err error) {
+	var (
+		status  int
+		code    string
+		detail  string
+		logging = slog.LevelError
+	)
+
+	switch {
+	case errors.Is(err, entity.ErrNotFound):
+		status, code, detail = http.StatusNotFound, "not_found", "the requested resource does not exist"
+		logging = slog.LevelInfo
+	default:
+		status, code, detail = http.StatusInternalServerError, "internal_error", "the request could not be completed"
+	}
+
+	a.logger.LogAttrs(r.Context(), logging, "request failed",
+		slog.String("code", code),
+		slog.Int("status", status),
+		slog.Any("error", err),
+	)
+	a.writeError(w, r, status, code, detail)
+}

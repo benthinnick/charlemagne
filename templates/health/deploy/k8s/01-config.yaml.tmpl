@@ -1,0 +1,57 @@
+{{if or .HasPostgres .HasVault}}apiVersion: v1
+kind: Secret
+metadata:
+  name: {{.Name}}-secrets
+  namespace: {{.Name}}
+type: Opaque
+stringData:
+{{if .HasVault}}  VAULT_TOKEN: dev-root-token
+{{end}}{{if .HasPostgres}}  POSTGRES_USER: {{.PostgresUser}}
+  POSTGRES_PASSWORD: {{.PostgresPassword}}
+  POSTGRES_DB: {{.PostgresDB}}
+{{end}}---
+{{end}}{{if .HasVault}}apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vault-seed
+  namespace: {{.Name}}
+data:
+  seed.sh: |
+    #!/bin/sh
+    # Seeds the dev Vault with the secrets the API overlays on top of its
+    # environment configuration.
+    set -eu
+
+    echo "waiting for vault at ${VAULT_ADDR}..."
+    attempt=0
+    until vault status >/dev/null 2>&1; do
+      attempt=$((attempt + 1))
+      if [ "${attempt}" -ge 30 ]; then
+        echo "vault did not become ready in time" >&2
+        exit 1
+      fi
+      sleep 1
+    done
+
+    vault kv put secret/{{.Name}}/config \
+      log_level="info" \
+      otel_traces_sampler_arg="1.0"
+
+    echo "seeded secret/{{.Name}}/config"
+---
+{{end}}apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: {{.Name}}
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    scrape_configs:
+      - job_name: {{.ServiceName}}
+        metrics_path: /metrics
+        static_configs:
+          - targets: ["api:8080"]

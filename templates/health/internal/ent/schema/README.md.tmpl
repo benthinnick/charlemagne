@@ -1,0 +1,25 @@
+# Ent schemas
+
+Table definitions live here and are owned by this service. Charlemagne does not
+generate domain tables.
+
+Add a Go file per entity, then run `charlemagne build {{.Name}}` (or `--stage orm`):
+
+```go
+package schema
+
+import (
+	"entgo.io/ent"
+	"entgo.io/ent/schema/field"
+)
+
+type User struct {
+	ent.Schema
+}
+
+func (User) Fields() []ent.Field {
+	return []ent.Field{
+		field.String("email").Unique(),
+	}
+}
+```

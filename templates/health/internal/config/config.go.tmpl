@@ -1,0 +1,188 @@
+// Package config assembles application configuration from layered sources.
+package config
+
+import (
+	"context"
+	"errors"
+	"fmt"
+{{if .HasVault}}	"strconv"
+{{end}}	"strings"
+	"time"
+
+	"github.com/caarlos0/env/v11"
+)
+
+// Config is the fully resolved configuration for the API service.
+type Config struct {
+	Env       string `env:"APP_ENV" envDefault:"local"`
+	LogLevel  string `env:"LOG_LEVEL" envDefault:"info"`
+	ServiceID string `env:"SERVICE_ID" envDefault:"{{.ID}}"`
+
+	HTTPAddr        string        `env:"HTTP_ADDR" envDefault:":8080"`
+	GRPCAddr        string        `env:"GRPC_ADDR" envDefault:":9090"`
+	ReadTimeout     time.Duration `env:"HTTP_READ_TIMEOUT" envDefault:"5s"`
+	WriteTimeout    time.Duration `env:"HTTP_WRITE_TIMEOUT" envDefault:"15s"`
+	IdleTimeout     time.Duration `env:"HTTP_IDLE_TIMEOUT" envDefault:"60s"`
+	RequestTimeout  time.Duration `env:"HTTP_REQUEST_TIMEOUT" envDefault:"10s"`
+	ShutdownTimeout time.Duration `env:"SHUTDOWN_TIMEOUT" envDefault:"15s"`
+{{if .HasPostgres}}
+	Postgres PostgresConfig
+{{end}}{{if .HasVault}}	Vault    VaultConfig
+{{end}}	OTel     OTelConfig
+}
+{{if .HasPostgres}}
+// PostgresConfig addresses the database used for readiness and later domain data.
+type PostgresConfig struct {
+	DSN         string        `env:"POSTGRES_DSN" envDefault:"postgres://{{.PostgresUser}}:{{.PostgresPassword}}@localhost:5432/{{.PostgresDB}}?sslmode=disable"`
+	MaxConns    int32         `env:"POSTGRES_MAX_CONNS" envDefault:"8"`
+	ConnTimeout time.Duration `env:"POSTGRES_CONN_TIMEOUT" envDefault:"5s"`
+}
+{{end}}{{if .HasVault}}
+// VaultConfig controls the optional Vault overlay.
+type VaultConfig struct {
+	Enabled    bool          `env:"VAULT_ENABLED" envDefault:"false"`
+	Address    string        `env:"VAULT_ADDR" envDefault:"http://127.0.0.1:8200"`
+	Token      string        `env:"VAULT_TOKEN"`
+	KVMount    string        `env:"VAULT_KV_MOUNT" envDefault:"secret"`
+	SecretPath string        `env:"VAULT_SECRET_PATH" envDefault:"{{.Name}}/config"`
+	Timeout    time.Duration `env:"VAULT_TIMEOUT" envDefault:"5s"`
+}
+
+const defaultVaultTimeout = 5 * time.Second
+
+// SecretReader returns a flat key/value map of secrets to overlay onto Config.
+type SecretReader interface {
+	ReadSecrets(ctx context.Context) (map[string]string, error)
+}
+
+type readerFactory func(VaultConfig) (SecretReader, error)
+{{end}}
+// OTelConfig controls trace export.
+type OTelConfig struct {
+	Enabled        bool    `env:"OTEL_ENABLED" envDefault:"true"`
+	ServiceName    string  `env:"OTEL_SERVICE_NAME" envDefault:"{{.ServiceName}}"`
+	ServiceVersion string  `env:"OTEL_SERVICE_VERSION" envDefault:"dev"`
+	Endpoint       string  `env:"OTEL_EXPORTER_OTLP_ENDPOINT" envDefault:"localhost:4317"`
+	Insecure       bool    `env:"OTEL_EXPORTER_OTLP_INSECURE" envDefault:"true"`
+	SamplerRatio   float64 `env:"OTEL_TRACES_SAMPLER_ARG" envDefault:"1.0"`
+}
+
+// Load resolves configuration from the environment{{if .HasVault}} and, when enabled, Vault{{end}}.
+func Load(ctx context.Context) (*Config, error) {
+{{if .HasVault}}	return load(ctx, func(vc VaultConfig) (SecretReader, error) {
+		return NewVaultReader(vc)
+	})
+{{else}}	_ = ctx
+	return load()
+{{end}}}
+{{if .HasVault}}
+func load(ctx context.Context, newReader readerFactory) (*Config, error) {
+	var cfg Config
+	if err := env.Parse(&cfg); err != nil {
+		return nil, fmt.Errorf("parse environment: %w", err)
+	}
+
+	if cfg.Vault.Enabled {
+		if err := applyVault(ctx, &cfg, newReader); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+func applyVault(ctx context.Context, cfg *Config, newReader readerFactory) error {
+	if cfg.Vault.Address == "" {
+		return errors.New("vault is enabled but VAULT_ADDR is empty")
+	}
+	if cfg.Vault.Token == "" {
+		return errors.New("vault is enabled but VAULT_TOKEN is empty")
+	}
+
+	reader, err := newReader(cfg.Vault)
+	if err != nil {
+		return fmt.Errorf("create vault reader: %w", err)
+	}
+
+	timeout := cfg.Vault.Timeout
+	if timeout <= 0 {
+		timeout = defaultVaultTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	secrets, err := reader.ReadSecrets(ctx)
+	if err != nil {
+		return fmt.Errorf("read secrets from vault: %w", err)
+	}
+	return applySecrets(cfg, secrets)
+}
+
+// applySecrets overlays Vault values onto cfg. Keys absent from the secret are
+// left untouched so the environment layer stays authoritative for them.
+func applySecrets(cfg *Config, secrets map[string]string) error {
+	for key, raw := range secrets {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+
+		var err error
+		switch strings.ToLower(key) {
+		case "log_level":
+			cfg.LogLevel = value
+		case "otel_traces_sampler_arg":
+			cfg.OTel.SamplerRatio, err = strconv.ParseFloat(value, 64)
+		}
+		if err != nil {
+			return fmt.Errorf("vault key %q: %w", key, err)
+		}
+	}
+	return nil
+}
+{{else}}
+func load() (*Config, error) {
+	var cfg Config
+	if err := env.Parse(&cfg); err != nil {
+		return nil, fmt.Errorf("parse environment: %w", err)
+	}
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+{{end}}
+func (c *Config) validate() error {
+	var errs []error
+
+	if _, ok := logLevels[strings.ToLower(c.LogLevel)]; !ok {
+		errs = append(errs, fmt.Errorf("LOG_LEVEL %q must be one of debug, info, warn, error", c.LogLevel))
+	}
+	if c.HTTPAddr == "" {
+		errs = append(errs, errors.New("HTTP_ADDR must not be empty"))
+	}
+	if c.GRPCAddr == "" {
+		errs = append(errs, errors.New("GRPC_ADDR must not be empty"))
+	}
+	if c.ServiceID == "" {
+		errs = append(errs, errors.New("SERVICE_ID must not be empty"))
+	}
+	if c.OTel.SamplerRatio < 0 || c.OTel.SamplerRatio > 1 {
+		errs = append(errs, fmt.Errorf("OTEL_TRACES_SAMPLER_ARG %v must be between 0 and 1", c.OTel.SamplerRatio))
+	}
+{{if .HasPostgres}}	if c.Postgres.DSN == "" {
+		errs = append(errs, errors.New("POSTGRES_DSN must not be empty"))
+	}
+	if c.Postgres.MaxConns <= 0 {
+		errs = append(errs, errors.New("POSTGRES_MAX_CONNS must be positive"))
+	}
+{{end}}
+	return errors.Join(errs...)
+}
+
+var logLevels = map[string]struct{}{
+	"debug": {}, "info": {}, "warn": {}, "error": {},
+}

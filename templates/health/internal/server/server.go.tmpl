@@ -1,0 +1,63 @@
+// Package server owns the HTTP surface: the routes, and one handler per file
+// that decodes the request, calls the use case, and picks the status code. All
+// application logic lives behind usecase.UseCase.
+package server
+
+import (
+	"log/slog"
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+
+	"{{.Module}}/internal/config"
+	"{{.Module}}/internal/usecase"
+	"github.com/benthinnick/distlibs/httpmw"
+)
+
+// API holds the handler dependencies.
+type API struct {
+	usecase usecase.UseCase
+	logger  *slog.Logger
+	metrics *httpmw.Metrics
+	version string
+}
+
+// Options configures transport-level API settings.
+type Options struct {
+	Version string
+}
+
+func New(uc usecase.UseCase, logger *slog.Logger, metrics *httpmw.Metrics, opts Options) *API {
+	if metrics == nil {
+		metrics = httpmw.NewMetrics()
+	}
+	return &API{
+		usecase: uc,
+		logger:  logger,
+		metrics: metrics,
+		version: opts.Version,
+	}
+}
+
+// Router assembles the middleware chain and routes.
+func (a *API) Router(cfg *config.Config) http.Handler {
+	router := chi.NewRouter()
+
+	router.Use(middleware.RequestID)
+	router.Use(middleware.RealIP)
+	router.Use(httpmw.Tracing(cfg.OTel.ServiceName))
+	router.Use(httpmw.Recoverer(a.logger, a.InternalError))
+	router.Use(a.metrics.Middleware())
+	router.Use(httpmw.AccessLog(a.logger))
+	router.Use(middleware.Timeout(cfg.RequestTimeout))
+
+	router.Get("/healthz", a.Healthz)
+	router.Get("/readyz", a.Readyz)
+	router.Handle("/metrics", a.metrics.Handler())
+
+	router.NotFound(a.NotFound)
+	router.MethodNotAllowed(a.MethodNotAllowed)
+
+	return router
+}

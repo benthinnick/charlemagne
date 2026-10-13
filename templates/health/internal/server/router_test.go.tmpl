@@ -1,0 +1,193 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
+	"{{.Module}}/internal/config"
+	"{{.Module}}/internal/entity"
+	"{{.Module}}/internal/providers"
+	"{{.Module}}/internal/usecase"
+	"github.com/benthinnick/distlibs/httpmw"
+)
+
+var spanRecorder = tracetest.NewSpanRecorder()
+
+func TestMain(m *testing.M) {
+	otel.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(spanRecorder)))
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+	os.Exit(m.Run())
+}
+
+func testConfig() *config.Config {
+	return &config.Config{
+		Env:            "test",
+		RequestTimeout: 5 * time.Second,
+		OTel:           config.OTelConfig{ServiceName: "{{.ServiceName}}"},
+	}
+}
+
+func discardLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
+
+func newAPI(uc usecase.UseCase) *API {
+	return New(uc, discardLogger(), httpmw.NewMetrics(), Options{Version: "test"})
+}
+
+type stubUseCase struct {
+	usecase.UnimplementedRPC
+	readiness func(context.Context) (entity.Readiness, error)
+}
+
+func (s stubUseCase) Readiness(ctx context.Context) (entity.Readiness, error) {
+	if s.readiness == nil {
+		return entity.Readiness{Ready: true}, nil
+	}
+	return s.readiness(ctx)
+}
+
+func newRouterServer(t *testing.T, api *API) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(api.Router(testConfig()))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func get(t *testing.T, srv *httptest.Server, path string) (*http.Response, []byte) {
+	t.Helper()
+	resp, err := srv.Client().Get(srv.URL + path)
+	require.NoError(t, err)
+	t.Cleanup(func() { resp.Body.Close() })
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return resp, body
+}
+
+func post(t *testing.T, srv *httptest.Server, path, contentType string, body io.Reader) (*http.Response, []byte) {
+	t.Helper()
+	resp, err := srv.Client().Post(srv.URL+path, contentType, body)
+	require.NoError(t, err)
+	t.Cleanup(func() { resp.Body.Close() })
+
+	payload, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return resp, payload
+}
+
+func TestServerSpanUsesRoutePattern(t *testing.T) {
+	srv := newRouterServer(t, newAPI(stubUseCase{}))
+
+	spanRecorder.Reset()
+	resp, _ := get(t, srv, "/nope")
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+
+	require.Eventually(t, func() bool {
+		for _, span := range spanRecorder.Ended() {
+			if span.Name() == "GET unmatched" {
+				return true
+			}
+		}
+		return false
+	}, time.Second, 10*time.Millisecond,
+		"server span should be named after the route pattern")
+}
+
+func TestRoutingFallbacks(t *testing.T) {
+	srv := newRouterServer(t, newAPI(stubUseCase{}))
+
+	t.Run("unknown path", func(t *testing.T) {
+		resp, body := get(t, srv, "/api/v1/nope")
+		assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+		assert.Contains(t, string(body), "no route matches this path")
+	})
+
+	t.Run("wrong method", func(t *testing.T) {
+		resp, body := post(t, srv, "/healthz", "application/json", strings.NewReader("{}"))
+		assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode)
+		assert.Contains(t, string(body), "method_not_allowed")
+	})
+}
+
+func TestPanicBecomesJSONError(t *testing.T) {
+	srv := newRouterServer(t, newAPI(stubUseCase{
+		readiness: func(context.Context) (entity.Readiness, error) {
+			panic("boom")
+		},
+	}))
+
+	resp, body := get(t, srv, "/readyz")
+	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+
+	var payload entity.ErrorResponse
+	require.NoError(t, json.Unmarshal(body, &payload))
+	assert.Equal(t, "internal_error", payload.Error)
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	metrics := httpmw.NewMetrics()
+	srv := newRouterServer(t, New(stubUseCase{}, discardLogger(), metrics, Options{Version: "test"}))
+
+	resp, _ := get(t, srv, "/nope")
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+
+	metricsResp, body := get(t, srv, "/metrics")
+	require.Equal(t, http.StatusOK, metricsResp.StatusCode)
+	assert.Contains(t, string(body), "http_requests_total")
+	assert.Contains(t, string(body), `route="unmatched"`)
+	assert.Contains(t, string(body), "http_request_size_bytes")
+	assert.Contains(t, string(body), "http_response_size_bytes")
+}
+
+func TestHealthAndReadinessThroughRouter(t *testing.T) {
+	logger := discardLogger()
+
+	t.Run("healthz ignores dependencies", func(t *testing.T) {
+		uc := usecase.New(providers.Providers{}, []usecase.Check{
+			{Name: "postgres", Probe: func(context.Context) error { return errors.New("down") }},
+		}, logger)
+		srv := newRouterServer(t, New(uc, logger, httpmw.NewMetrics(), Options{Version: "1.2.3"}))
+
+		resp, body := get(t, srv, "/healthz")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Contains(t, string(body), `"version":"1.2.3"`)
+	})
+
+	t.Run("readyz reports each dependency", func(t *testing.T) {
+		uc := usecase.New(providers.Providers{}, []usecase.Check{
+			{Name: "postgres", Probe: func(context.Context) error { return nil }},
+			{Name: "vault", Probe: func(context.Context) error { return errors.New("sealed") }},
+		}, logger)
+		srv := newRouterServer(t, New(uc, logger, httpmw.NewMetrics(), Options{Version: "test"}))
+
+		resp, body := get(t, srv, "/readyz")
+		assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+
+		var payload struct {
+			Status string            `json:"status"`
+			Checks map[string]string `json:"checks"`
+		}
+		require.NoError(t, json.Unmarshal(body, &payload))
+		assert.Equal(t, "not_ready", payload.Status)
+		assert.Equal(t, "ok", payload.Checks["postgres"])
+		assert.Contains(t, payload.Checks["vault"], "sealed")
+	})
+}

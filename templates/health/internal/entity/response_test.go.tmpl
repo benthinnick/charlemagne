@@ -1,0 +1,24 @@
+package entity
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestHealthMarshal(t *testing.T) {
+	body, err := Health{Status: "ok", Version: "1.2.3"}.Marshal()
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"status":"ok","version":"1.2.3"}`, string(body))
+}
+
+func TestReadinessMarshal(t *testing.T) {
+	ready, err := Readiness{Ready: true, Checks: map[string]string{"postgres": "ok"}}.Marshal()
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"status":"ready","checks":{"postgres":"ok"}}`, string(ready))
+
+	notReady, err := Readiness{Ready: false, Checks: nil}.Marshal()
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"status":"not_ready","checks":{}}`, string(notReady))
+}

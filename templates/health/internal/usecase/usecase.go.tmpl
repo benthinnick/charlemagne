@@ -1,0 +1,28 @@
+// Package usecase holds the application logic that sits between the HTTP layer
+// and the providers.
+package usecase
+
+import (
+	"context"
+	"log/slog"
+
+	"{{.Module}}/internal/entity"
+	"{{.Module}}/internal/providers"
+)
+
+// UseCase is everything the transport layer is allowed to ask for.
+type UseCase interface {
+	Readiness(ctx context.Context) (entity.Readiness, error)
+	RPC
+}
+
+type useCase struct {
+	providers providers.Providers
+	checks    []Check
+	logger    *slog.Logger
+}
+
+// New builds the single use case implementation over the given providers.
+func New(p providers.Providers, checks []Check, logger *slog.Logger) UseCase {
+	return &useCase{providers: p, checks: checks, logger: logger}
+}

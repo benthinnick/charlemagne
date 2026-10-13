@@ -1,0 +1,62 @@
+COMPOSE := docker compose -f deploy/docker-compose.yml
+VERSION ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
+KIND_CLUSTER := {{.Name}}
+KIND_CONFIG := deploy/k8s/kind-config.yaml
+# Numbered manifests only — kind-config.yaml is for the kind CLI, not kubectl.
+K8S_MANIFESTS := \
+	deploy/k8s/00-namespace.yaml \
+	deploy/k8s/01-config.yaml \
+	deploy/k8s/02-deps.yaml \
+{{if .HasVault}}	deploy/k8s/03-jobs.yaml \
+{{end}}	deploy/k8s/04-api.yaml \
+	deploy/k8s/05-logging.yaml
+
+# -race needs cgo and a 64-bit C toolchain; override with TESTFLAGS= on hosts
+# that do not have one.
+TESTFLAGS ?= -race
+
+.PHONY: build test vet tidy run up down logs \
+	kind kind-up kind-load kind-deploy kind-down
+
+build:
+	go build -trimpath -ldflags "-s -w -X main.version=$(VERSION)" -o bin/api ./cmd/api
+
+test:
+	go test ./... $(TESTFLAGS) -count=1
+
+vet:
+	go vet ./...
+
+tidy:
+	go mod tidy
+
+run:
+	go run ./cmd/api
+
+up:
+	$(COMPOSE) up --build -d
+
+down:
+	$(COMPOSE) down -v
+
+logs:
+	$(COMPOSE) logs -f api
+
+# Full local Kubernetes path: recreate kind cluster, load the API image, apply manifests.
+kind: kind-up kind-load kind-deploy
+
+# Delete and recreate so extraPortMappings stay in sync with the manifests.
+kind-up:
+	-kind delete cluster --name $(KIND_CLUSTER)
+	kind create cluster --name $(KIND_CLUSTER) --config $(KIND_CONFIG)
+
+kind-load:
+	docker build -t {{.Name}}-api:local -f build/Dockerfile .
+	kind load docker-image {{.Name}}-api:local --name $(KIND_CLUSTER)
+
+kind-deploy:
+	kubectl apply $(addprefix -f ,$(K8S_MANIFESTS))
+	kubectl -n {{.Name}} rollout status deploy/api
+
+kind-down:
+	kind delete cluster --name $(KIND_CLUSTER)

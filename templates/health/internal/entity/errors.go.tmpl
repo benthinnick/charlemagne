@@ -1,0 +1,10 @@
+package entity
+
+import "errors"
+
+// Outcomes the rest of the application matches with errors.Is. They live here
+// rather than in usecase because the provider layer is what produces them, and
+// providers must not depend on the use case that consumes it.
+var (
+	ErrNotFound = errors.New("resource not found")
+)

@@ -1,0 +1,68 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"{{.Module}}/internal/entity"
+	"github.com/benthinnick/distlibs/httpmw"
+)
+
+func TestHealthz(t *testing.T) {
+	api := New(stubUseCase{}, discardLogger(), httpmw.NewMetrics(), Options{Version: "1.2.3"})
+	rec := httptest.NewRecorder()
+
+	api.Healthz(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.JSONEq(t, `{"status":"ok","version":"1.2.3"}`, rec.Body.String())
+}
+
+func TestReadyzStatusFollowsReport(t *testing.T) {
+	tests := []struct {
+		name       string
+		report     entity.Readiness
+		wantStatus int
+		wantState  string
+	}{
+		{
+			name:       "ready",
+			report:     entity.Readiness{Ready: true, Checks: map[string]string{"postgres": "ok"}},
+			wantStatus: http.StatusOK,
+			wantState:  "ready",
+		},
+		{
+			name:       "not ready",
+			report:     entity.Readiness{Ready: false, Checks: map[string]string{"vault": "error: sealed"}},
+			wantStatus: http.StatusServiceUnavailable,
+			wantState:  "not_ready",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			api := newAPI(stubUseCase{
+				readiness: func(context.Context) (entity.Readiness, error) { return tc.report, nil },
+			})
+			rec := httptest.NewRecorder()
+
+			api.Readyz(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+
+			require.Equal(t, tc.wantStatus, rec.Code)
+
+			var body struct {
+				Status string            `json:"status"`
+				Checks map[string]string `json:"checks"`
+			}
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+			assert.Equal(t, tc.wantState, body.Status)
+			assert.Equal(t, tc.report.Checks, body.Checks)
+		})
+	}
+}

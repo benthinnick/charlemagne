@@ -1,0 +1,37 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vault-seed
+  namespace: {{.Name}}
+  labels:
+    app: vault-seed
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+        app: vault-seed
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: vault-seed
+          image: hashicorp/vault:1.20
+          command: ["/bin/sh", "/seed.sh"]
+          env:
+            - name: VAULT_ADDR
+              value: http://vault:8200
+            - name: VAULT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{.Name}}-secrets
+                  key: VAULT_TOKEN
+          volumeMounts:
+            - name: seed
+              mountPath: /seed.sh
+              subPath: seed.sh
+              readOnly: true
+      volumes:
+        - name: seed
+          configMap:
+            name: vault-seed
+            defaultMode: 0755

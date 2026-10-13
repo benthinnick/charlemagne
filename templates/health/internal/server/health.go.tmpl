@@ -1,0 +1,12 @@
+package server
+
+import (
+	"net/http"
+
+	"{{.Module}}/internal/entity"
+)
+
+// Healthz is the liveness probe. It deliberately touches no dependency.
+func (a *API) Healthz(w http.ResponseWriter, r *http.Request) {
+	a.writeJSON(w, r, http.StatusOK, entity.Health{Status: "ok", Version: a.version})
+}

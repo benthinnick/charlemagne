@@ -1,0 +1,39 @@
+package usecase
+
+import (
+	"context"
+	"log/slog"
+	"time"
+
+	"{{.Module}}/internal/entity"
+)
+
+const readinessTimeout = 2 * time.Second
+
+// Check is a named dependency probe.
+type Check struct {
+	Name  string
+	Probe func(ctx context.Context) error
+}
+
+// Readiness probes every dependency and reports whether the service can serve
+// traffic. A failing probe never fails the call; it is recorded in the report.
+// The error return exists to keep the interface uniform and is always nil.
+func (u *useCase) Readiness(ctx context.Context) (entity.Readiness, error) {
+	ctx, cancel := context.WithTimeout(ctx, readinessTimeout)
+	defer cancel()
+
+	report := entity.Readiness{Ready: true, Checks: make(map[string]string, len(u.checks))}
+
+	for _, check := range u.checks {
+		if err := check.Probe(ctx); err != nil {
+			report.Ready = false
+			report.Checks[check.Name] = "error: " + err.Error()
+			u.logger.WarnContext(ctx, "readiness check failed",
+				slog.String("check", check.Name), slog.Any("error", err))
+			continue
+		}
+		report.Checks[check.Name] = "ok"
+	}
+	return report, nil
+}

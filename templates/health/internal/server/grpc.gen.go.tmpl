@@ -1,0 +1,10 @@
+package server
+
+import (
+	"google.golang.org/grpc"
+
+	"{{.Module}}/internal/usecase"
+)
+
+// RegisterGRPC attaches generated gRPC services. charlemagne build replaces this file.
+func RegisterGRPC(*grpc.Server, usecase.UseCase) {}

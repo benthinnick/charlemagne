@@ -1,0 +1,20 @@
+package server
+
+import (
+	"net/http"
+)
+
+// Readyz reports whether every dependency is usable.
+func (a *API) Readyz(w http.ResponseWriter, r *http.Request) {
+	report, err := a.usecase.Readiness(r.Context())
+	if err != nil {
+		a.writeServiceError(w, r, err)
+		return
+	}
+
+	status := http.StatusOK
+	if !report.Ready {
+		status = http.StatusServiceUnavailable
+	}
+	a.writeJSON(w, r, status, report)
+}

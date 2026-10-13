@@ -1,0 +1,42 @@
+package usecase_test
+
+import (
+	"context"
+	"errors"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"{{.Module}}/internal/usecase"
+)
+
+func (s *UseCaseSuite) TestReadiness_ReportsEveryCheck() {
+	uc := s.newUseCaseWithChecks([]usecase.Check{
+		{Name: "postgres", Probe: func(context.Context) error { return nil }},
+		{Name: "vault", Probe: func(context.Context) error { return errors.New("sealed") }},
+	})
+
+	report, err := uc.Readiness(context.Background())
+	require.NoError(s.T(), err)
+	assert.False(s.T(), report.Ready)
+	assert.Equal(s.T(), "ok", report.Checks["postgres"])
+	assert.Equal(s.T(), "error: sealed", report.Checks["vault"])
+}
+
+func (s *UseCaseSuite) TestReadiness_ReadyWhenAllPass() {
+	uc := s.newUseCaseWithChecks([]usecase.Check{
+		{Name: "postgres", Probe: func(context.Context) error { return nil }},
+	})
+
+	report, err := uc.Readiness(context.Background())
+	require.NoError(s.T(), err)
+	assert.True(s.T(), report.Ready)
+	assert.Equal(s.T(), map[string]string{"postgres": "ok"}, report.Checks)
+}
+
+func (s *UseCaseSuite) TestReadiness_WithoutChecksIsReady() {
+	report, err := s.UC.Readiness(context.Background())
+	require.NoError(s.T(), err)
+	assert.True(s.T(), report.Ready)
+	assert.Empty(s.T(), report.Checks)
+}

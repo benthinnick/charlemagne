@@ -1,0 +1,49 @@
+package entity
+
+import "encoding/json"
+
+// ErrorResponse is the single error shape every endpoint returns. The trace ID
+// is included so a caller can hand it straight to whoever reads Jaeger.
+type ErrorResponse struct {
+	Error     string `json:"error"`
+	Detail    string `json:"detail,omitempty"`
+	RequestID string `json:"requestId,omitempty"`
+	TraceID   string `json:"traceId,omitempty"`
+}
+
+func (e ErrorResponse) Marshal() ([]byte, error) { return json.Marshal(e) }
+
+// Health is the liveness payload.
+type Health struct {
+	Status  string `json:"status"`
+	Version string `json:"version"`
+}
+
+func (h Health) Marshal() ([]byte, error) { return json.Marshal(h) }
+
+// Readiness is the outcome of probing every dependency. Checks maps a
+// dependency name to "ok" or a description of why it failed. Ready drives the
+// caller's status code and is not itself part of the payload.
+type Readiness struct {
+	Ready  bool
+	Checks map[string]string
+}
+
+// Marshal renders {"status":"ready|not_ready","checks":{...}}, deriving the
+// status string so no other layer has to know the wording.
+func (r Readiness) Marshal() ([]byte, error) {
+	status := "not_ready"
+	if r.Ready {
+		status = "ready"
+	}
+
+	checks := r.Checks
+	if checks == nil {
+		checks = map[string]string{}
+	}
+
+	return json.Marshal(struct {
+		Status string            `json:"status"`
+		Checks map[string]string `json:"checks"`
+	}{Status: status, Checks: checks})
+}

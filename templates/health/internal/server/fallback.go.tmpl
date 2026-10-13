@@ -1,0 +1,14 @@
+package server
+
+import "net/http"
+
+// NotFound and MethodNotAllowed keep the router from having to write bodies of
+// its own, so every response in the service comes from this package.
+func (a *API) NotFound(w http.ResponseWriter, r *http.Request) {
+	a.writeError(w, r, http.StatusNotFound, "not_found", "no route matches this path")
+}
+
+func (a *API) MethodNotAllowed(w http.ResponseWriter, r *http.Request) {
+	a.writeError(w, r, http.StatusMethodNotAllowed, "method_not_allowed",
+		"this method is not supported on this path")
+}
